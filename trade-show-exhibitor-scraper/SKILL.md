@@ -1,6 +1,6 @@
 ---
 name: trade-show-exhibitor-scraper
-description: Scrape exhibitor data from trade show websites like NEPCON Japan (GraphQL API) and electronica (ColdFusion/AJAX). Handles AJAX lazy-loading pagination, cookie-based API auth, and ColdFusion CMS pages. Outputs Excel with Chinese exhibitors classified by region (Shenzhen/Xiamen/Guangdong/Fujian/Other).
+description: Scrape exhibitor data from trade show websites. Supports 4 architectures: GraphQL API (Reed Expo/NEPCON), Algolia Search API (NuernbergMesse Next.js sites like EUROGUSS), REST API with API Key (Messe Frankfurt), and CMS/AJAX (electronica). Outputs Excel with Chinese exhibitors classified by region.
 agent_created: true
 ---
 
@@ -8,21 +8,26 @@ agent_created: true
 
 ## Overview
 
-This skill handles end-to-end scraping of trade show exhibitor directories, supporting two major website architectures:
+This skill handles end-to-end scraping of trade show exhibitor directories, supporting four major website architectures:
 
-1. **GraphQL API** (NEPCON-style) — Direct async API calls with httpx, cookie-based auth
-2. **CMS/AJAX** (electronica-style) — Playwright Python for AJAX-lazy-loaded list pages + httpx async batch-scraping of detail pages
+1. **GraphQL API** (NEPCON-style / Reed Expo) — Async httpx, cookie-based auth, high concurrency
+2. **Algolia Search API** (EUROGUSS-style / NuernbergMesse Next.js) — Direct Algolia REST API, one-request fetch all, no auth needed
+3. **REST API** (Light+Building-style / Messe Frankfurt) — Sync requests, API Key header auth, paginated
+4. **CMS/AJAX** (electronica-style) — Playwright for list pages + httpx async for detail pages
 
-Output: Region-classified Excel sheets (13+ fields per exhibitor) + JSON backup.
+Output: Region-classified Excel sheets (12+ fields per exhibitor) + JSON backup.
 
 ## Workflow Decision Tree
 
 ```
 Is there a direct API (check browser devtools network tab)?
-├── YES → Use "GraphQL API Workflow"
+├── YES → What kind?
+│   ├── POST to algolianet.com or algolia.net → Use "Workflow 4: Algolia Search API"
+│   ├── POST with GraphQL query body          → Use "Workflow 1: GraphQL API"
+│   └── GET with ?pageNumber=                 → Use "Workflow 3: REST API with API Key"
 └── NO  → Check if XLS download exists?
     ├── YES → Try downloading via browser session
-    └── NO  → Use "CMS/AJAX Workflow"
+    └── NO  → Use "Workflow 2: CMS/AJAX Workflow"
 ```
 
 ## Workflow 1: GraphQL API (NEPCON Japan style)
@@ -143,9 +148,212 @@ Key HTML class selectors for electronica-style pages:
 re.search(r'class="ce_phone[^"]*">.*?<a[^>]*>([^<]+)</a>', html, re.DOTALL)
 ```
 
-## Region Classification
+## Workflow 4: Algolia Search API (NuernbergMesse Next.js style)
 
-Use these regex patterns to classify Chinese exhibitors by region:
+**Use when**: The site is a NuernbergMesse event (euroguss.de, pcimeurope.com, etc.) built with Next.js + Sitecore. Look for POST requests to `algolianet.com` or `algolia.net` in devtools Network tab.
+
+**Why this is the best workflow**: Algolia stores ALL exhibitor data including contact details, descriptions, products, and employee info in a single index. Usually one API call fetches everything (no detail page scraping needed).
+
+### Step 1: Find API Credentials
+
+Open devtools → Network → filter by `algolia`. Find a POST to `/1/indexes/*/queries`:
+
+```
+Application ID: x-algolia-application-id header value
+API Key:        x-algolia-api-key header value  
+Index Name:     From request body → "indexName" field
+Site Filter:    From request body → "filters" field (e.g., "site:guss")
+```
+
+### Step 2: Fetch All Exhibitors
+
+NuernbergMesse events typically have <1000 exhibitors, so set `hitsPerPage=1000`:
+
+```python
+import requests
+
+API_URL = "https://{appid}-2.algolianet.com/1/indexes/*/queries"
+HEADERS = {
+    "x-algolia-api-key": "<key>",
+    "x-algolia-application-id": "<appid>",
+    "content-type": "text/plain",
+}
+
+payload = {
+    "requests": [{
+        "indexName": "prod_website_companies_en",
+        "params": "distinct=true&filters=site%3Aguss&hitsPerPage=1000&page=0&query="
+    }]
+}
+resp = requests.post(API_URL, json=payload, headers=HEADERS)
+hits = resp.json()["results"][0]["hits"]  # All exhibitors!
+```
+
+### Step 3: Fields Available in Algolia
+
+| Algolia Field | Description |
+|---|---|
+| `companyName` | Company name |
+| `country` | Country (English) |
+| `booth[{boothHall, boothNumber}]` | Hall & booth number |
+| `streetno, postcode, city` | Address |
+| `email` | Company email |
+| `companyDescription` | HTML description (use `clean_text()`) |
+| `companyType` | Type (Manufacturer/Supplier/etc) |
+| `logo` | Logo image URL |
+| `url` | Detail page path (e.g. `/en/exhibitors/2a-spa-2520174`) |
+| `employee[{firstName,lastName,function,email}]` | Contact persons |
+| `products[]` | Product list |
+| `keyword[]` | Keyword tags |
+| `coExhibitors[]` | Co-exhibitor names |
+| `filternomenclature_DEF/BERUF/BRANCHE` | Product categories |
+| `objectID` | Unique ID |
+
+**Known gaps vs. detail page**: Website URL and phone number are NOT in Algolia but ARE on the detail page. If needed, selectively scrape detail pages for those 2 fields.
+
+### Step 4: Detail Pages (if needed)
+
+Detail page URL pattern: `https://{domain}{url}` where `url` comes from Algolia.
+
+Website extraction from detail page:
+```python
+# Look for <a> with "Website" label
+re.search(r'Website.*?href="([^"]+)"', html, re.DOTALL)
+```
+
+Phone extraction:
+```python
+# Phone is in <a href="tel:+39..."> tag
+re.search(r'href="tel:([^"]+)"', html)
+```
+
+## Workflow 3: REST API with API Key (Messe Frankfurt style)
+
+**Use when**: The site uses a REST API with `?pageNumber=N` pagination and an API Key in headers.
+
+### Step 1: Find API Endpoint & Key
+
+Open browser devtools → Network → XHR/Fetch tab. Look for requests to `api.*.com` with these characteristics:
+
+- GET request with `pageNumber` parameter
+- Response shape: `{"result": {"hits": [...], "total": N}}`
+- Header: `apikey: <base64-looking-string>`
+
+### Step 2: Configure & Test Single Page
+
+```python
+CONFIG = {
+    "API_ENDPOINT": "https://api.messefrankfurt.com/service/esb_api/exhibitor-service/api/2.1/public/exhibitor/search",
+    "HEADERS": {
+        "apikey": "<key from browser>",
+        "origin": "https://show-name.messefrankfurt.com",
+        "referer": "https://show-name.messefrankfurt.com/",
+        "accept": "application/json",
+    },
+    "PARAMS": {
+        "language": "en-GB",
+        "pageSize": 30,
+        "findEventVariable": "LIGHTBUILDING",  # show-specific
+    }
+}
+```
+
+### Step 3: Sync Loop with Delay + Retry
+
+Messe Frankfurt APIs typically support only serial requests (no high concurrency). Use **`tenacity`** for robust retry:
+
+```python
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(10),
+    retry=retry_if_exception_type((ConnectionError, Timeout)),
+    reraise=True
+)
+def fetch_page(page):
+    resp = requests.get(url, headers=HEADERS, params={**PARAMS, "pageNumber": page}, timeout=15, allow_redirects=False)
+    resp.raise_for_status()
+    return resp.json()
+```
+
+**Critical**: Use `allow_redirects=False` to catch API key expiry (Messe Frankfurt returns 302 redirect to login page when key expires).
+
+### Step 4: Add Anti-Detection Delay
+
+```python
+import random, time
+
+for page in range(1, max_pages + 1):
+    data = fetch_page(page)
+    # process data...
+    delay = 1.5 + random.uniform(0.5, 1.5)  # 1.5–3.0s random jitter
+    time.sleep(delay)
+```
+
+### Step 5: Detect & Handle API Key Expiry
+
+```python
+except Exception as e:
+    if "401" in str(e) or "Unauthorized" in str(e) or "302" in str(e):
+        logger.critical("API key expired! Update CONFIG['HEADERS']['apikey']")
+        break
+```
+
+### Step 6: Construct Detail Page URLs
+
+Messe Frankfurt detail pages use a specific URL pattern derived from the API response:
+
+```python
+links = exhibitor.get("presentationLinks", [])
+if links and links[0].get("exhibitorUrlRewrite"):
+    url = f"https://{show}.messefrankfurt.com/frankfurt/en/exhibitor-search.detail.html/{rewrite}.html"
+```
+
+## Best Practices (all workflows)
+
+### Text Cleaning Pipeline
+
+Always chain these in order when processing scraped text:
+
+```python
+def _clean(text):
+    if not text: return ""
+    text = str(text)
+    text = re.sub(r'<[^>]+>', '', text)       # 1. strip HTML tags
+    text = re.sub(r'&[a-z0-9]+;', '', text)   # 2. strip HTML entities (&nbsp; etc)
+    text = re.sub(r'\s+', ' ', text).strip()   # 3. collapse whitespace
+    text = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', text)  # 4. strip control chars
+    return text
+```
+
+### Retry Strategy
+
+Use `tenacity` library instead of manual `for _ in range(N)` loops:
+
+```python
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+
+@retry(stop=stop_after_attempt(3), wait=wait_fixed(10),
+       retry=retry_if_exception_type((ConnectionError, Timeout)))
+def robust_request(url, **kwargs):
+    return requests.get(url, timeout=15, **kwargs)
+```
+
+### Logging Setup
+
+Always configure dual logging (file + console) for long-running scrapes:
+
+```python
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("scrape.log", encoding='utf-8'),
+              logging.StreamHandler()]
+)
+```
+
+## Region Classification
 
 ```python
 CHINA_PATTERN = re.compile(r'(?:中国|china|\+86)', re.IGNORECASE)
@@ -186,6 +394,8 @@ sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', value)
 The scripts are provided as reference implementations, not for direct execution (paths, cookies, and event IDs are session-specific):
 - `scripts/reference_nepcon.py` — NEPCON Japan GraphQL API approach  
 - `scripts/reference_electronica.py` — electronica CMS/AJAX approach
+- `scripts/reference_lightbuilding.py` — Light+Building REST API approach (Messe Frankfurt)
+- `scripts/reference_euroguss.py` — EUROGUSS Algolia API approach (NuernbergMesse Next.js)
 
 ## Common Pitfalls
 
@@ -194,3 +404,19 @@ The scripts are provided as reference implementations, not for direct execution 
 3. **`<a>` tag extraction** — for nested divs, always extract from `<a>` tags, not `</div>` boundaries
 4. **AJAX lazy loading** — must scroll to bottom to trigger all items
 5. **Mixed locale countries** — country names can be in Japanese/Chinese/English; classification must search all text fields
+6. **API key expiry** — use `allow_redirects=False` to detect 302 redirect (Messe Frankfurt sends you to login page when key expires)
+7. **Rate limiting** — REST APIs often have anti-scraping thresholds; always add 1.5–3s random delay between pages
+8. **Skipped `raise_for_status()`** — always call `resp.raise_for_status()` before parsing JSON to catch auth errors early
+
+## 经验更新 2026-06-02
+
+### Algolia 单次全量抓取
+- EUROGUSS 2026：hitsPerPage=1000 一次请求获取 728 家参展商全部数据（无需翻页）
+- NuernbergMesse 展会规模通常 ≤1000，推荐先用 hitsPerPage=1000 试探，不够再加 page=1
+
+### 区域分组用户反馈
+- 用户期望 Excel 按区域分独立工作表，而非单一 sheet。修复：`save_excel()` 改为逐区域调用 `write_sheet()`，最后添加 Summary 汇总页
+- 不同展会的中国展商区域分布差异大（EUROGUSS：浙江12/江苏6/台湾5/香港4；NEPCON：深圳/广东为主），需按展会调整区域关键词
+
+### 详情页补充字段
+- Algolia API 缺失 Website 和 Phone，需额外抓取详情页。Website 用 `re.search(r'Website.*?href="([^"]+)"', html)`，Phone 用 `re.search(r'href="tel:([^"]+)"', html)`
