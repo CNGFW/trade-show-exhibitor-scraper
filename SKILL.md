@@ -1,6 +1,6 @@
 ---
 name: trade-show-exhibitor-scraper
-description: Scrape exhibitor data from trade show websites like NEPCON Japan (GraphQL API) and electronica (ColdFusion/AJAX). Handles AJAX lazy-loading pagination, cookie-based API auth, and ColdFusion CMS pages. Outputs Excel with Chinese exhibitors classified by region (Shenzhen/Xiamen/Guangdong/Fujian/Other).
+description: Scrape exhibitor data from trade show websites. Supports 4 architectures: GraphQL API (Reed Expo/NEPCON), Algolia Search API (NuernbergMesse Next.js sites like EUROGUSS), REST API with API Key (Messe Frankfurt), and CMS/AJAX (electronica). Outputs Excel with Chinese exhibitors classified by region.
 agent_created: true
 ---
 
@@ -8,11 +8,12 @@ agent_created: true
 
 ## Overview
 
-This skill handles end-to-end scraping of trade show exhibitor directories, supporting three major website architectures:
+This skill handles end-to-end scraping of trade show exhibitor directories, supporting four major website architectures:
 
 1. **GraphQL API** (NEPCON-style / Reed Expo) — Async httpx, cookie-based auth, high concurrency
-2. **REST API** (Light+Building-style / Messe Frankfurt) — Sync requests, API Key header auth, paginated
-3. **CMS/AJAX** (electronica-style) — Playwright for list pages + httpx async for detail pages
+2. **Algolia Search API** (EUROGUSS-style / NuernbergMesse Next.js) — Direct Algolia REST API, one-request fetch all, no auth needed
+3. **REST API** (Light+Building-style / Messe Frankfurt) — Sync requests, API Key header auth, paginated
+4. **CMS/AJAX** (electronica-style) — Playwright for list pages + httpx async for detail pages
 
 Output: Region-classified Excel sheets (12+ fields per exhibitor) + JSON backup.
 
@@ -20,9 +21,10 @@ Output: Region-classified Excel sheets (12+ fields per exhibitor) + JSON backup.
 
 ```
 Is there a direct API (check browser devtools network tab)?
-├── YES → GraphQL or REST?
-│   ├── GraphQL (POST with query body) → Use "Workflow 1: GraphQL API"
-│   └── REST (GET with ?pageNumber=)    → Use "Workflow 3: REST API with API Key"
+├── YES → What kind?
+│   ├── POST to algolianet.com or algolia.net → Use "Workflow 4: Algolia Search API"
+│   ├── POST with GraphQL query body          → Use "Workflow 1: GraphQL API"
+│   └── GET with ?pageNumber=                 → Use "Workflow 3: REST API with API Key"
 └── NO  → Check if XLS download exists?
     ├── YES → Try downloading via browser session
     └── NO  → Use "Workflow 2: CMS/AJAX Workflow"
@@ -144,6 +146,85 @@ Key HTML class selectors for electronica-style pages:
 **Critical parsing technique**: Nested divs make `(.*?)</div>` unreliable. Instead, extract from `<a>` tags:
 ```python
 re.search(r'class="ce_phone[^"]*">.*?<a[^>]*>([^<]+)</a>', html, re.DOTALL)
+```
+
+## Workflow 4: Algolia Search API (NuernbergMesse Next.js style)
+
+**Use when**: The site is a NuernbergMesse event (euroguss.de, pcimeurope.com, etc.) built with Next.js + Sitecore. Look for POST requests to `algolianet.com` or `algolia.net` in devtools Network tab.
+
+**Why this is the best workflow**: Algolia stores ALL exhibitor data including contact details, descriptions, products, and employee info in a single index. Usually one API call fetches everything (no detail page scraping needed).
+
+### Step 1: Find API Credentials
+
+Open devtools → Network → filter by `algolia`. Find a POST to `/1/indexes/*/queries`:
+
+```
+Application ID: x-algolia-application-id header value
+API Key:        x-algolia-api-key header value  
+Index Name:     From request body → "indexName" field
+Site Filter:    From request body → "filters" field (e.g., "site:guss")
+```
+
+### Step 2: Fetch All Exhibitors
+
+NuernbergMesse events typically have <1000 exhibitors, so set `hitsPerPage=1000`:
+
+```python
+import requests
+
+API_URL = "https://{appid}-2.algolianet.com/1/indexes/*/queries"
+HEADERS = {
+    "x-algolia-api-key": "<key>",
+    "x-algolia-application-id": "<appid>",
+    "content-type": "text/plain",
+}
+
+payload = {
+    "requests": [{
+        "indexName": "prod_website_companies_en",
+        "params": "distinct=true&filters=site%3Aguss&hitsPerPage=1000&page=0&query="
+    }]
+}
+resp = requests.post(API_URL, json=payload, headers=HEADERS)
+hits = resp.json()["results"][0]["hits"]  # All exhibitors!
+```
+
+### Step 3: Fields Available in Algolia
+
+| Algolia Field | Description |
+|---|---|
+| `companyName` | Company name |
+| `country` | Country (English) |
+| `booth[{boothHall, boothNumber}]` | Hall & booth number |
+| `streetno, postcode, city` | Address |
+| `email` | Company email |
+| `companyDescription` | HTML description (use `clean_text()`) |
+| `companyType` | Type (Manufacturer/Supplier/etc) |
+| `logo` | Logo image URL |
+| `url` | Detail page path (e.g. `/en/exhibitors/2a-spa-2520174`) |
+| `employee[{firstName,lastName,function,email}]` | Contact persons |
+| `products[]` | Product list |
+| `keyword[]` | Keyword tags |
+| `coExhibitors[]` | Co-exhibitor names |
+| `filternomenclature_DEF/BERUF/BRANCHE` | Product categories |
+| `objectID` | Unique ID |
+
+**Known gaps vs. detail page**: Website URL and phone number are NOT in Algolia but ARE on the detail page. If needed, selectively scrape detail pages for those 2 fields.
+
+### Step 4: Detail Pages (if needed)
+
+Detail page URL pattern: `https://{domain}{url}` where `url` comes from Algolia.
+
+Website extraction from detail page:
+```python
+# Look for <a> with "Website" label
+re.search(r'Website.*?href="([^"]+)"', html, re.DOTALL)
+```
+
+Phone extraction:
+```python
+# Phone is in <a href="tel:+39..."> tag
+re.search(r'href="tel:([^"]+)"', html)
 ```
 
 ## Workflow 3: REST API with API Key (Messe Frankfurt style)
@@ -314,6 +395,7 @@ The scripts are provided as reference implementations, not for direct execution 
 - `scripts/reference_nepcon.py` — NEPCON Japan GraphQL API approach  
 - `scripts/reference_electronica.py` — electronica CMS/AJAX approach
 - `scripts/reference_lightbuilding.py` — Light+Building REST API approach (Messe Frankfurt)
+- `scripts/reference_euroguss.py` — EUROGUSS Algolia API approach (NuernbergMesse Next.js)
 
 ## Common Pitfalls
 
