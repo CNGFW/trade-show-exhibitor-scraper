@@ -168,19 +168,10 @@ def extract_exhibitor(hit):
     }
 
 
-def save_excel(exhibitors, filename):
-    """Save to Excel with formatting"""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "EUROGUSS Exhibitors"
+def write_sheet(wb, sheet_name, exhibitors, headers):
+    """Write a batch of exhibitors to a sheet with formatting"""
+    ws = wb.create_sheet(title=sheet_name)
     
-    if not exhibitors:
-        logger.warning("No exhibitors to save!")
-        return
-    
-    headers = list(exhibitors[0].keys())
-    
-    # Header styling
     header_font = Font(bold=True, color="FFFFFF", size=11)
     header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -191,50 +182,87 @@ def save_excel(exhibitors, filename):
         cell.fill = header_fill
         cell.alignment = header_align
     
-    # Data rows
     for row_idx, ex in enumerate(exhibitors, 2):
         for col_idx, header in enumerate(headers, 1):
             val = ex.get(header, "")
-            # Sanitize: remove control characters
             if isinstance(val, str):
                 val = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', val)
             ws.cell(row=row_idx, column=col_idx, value=val)
     
-    # Auto-fit column widths
+    # Auto-fit
     for col in ws.columns:
         max_len = 0
         col_letter = col[0].column_letter
-        for cell in col[:50]:  # Check first 50 rows
+        for cell in col[:50]:
             if cell.value:
                 max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[col_letter].width = min(max_len + 4, 50)
     
-    # Freeze header
     ws.freeze_panes = "A2"
+    last_col = ws.cell(row=1, column=len(headers)).column_letter
+    ws.auto_filter.ref = f"A1:{last_col}{len(exhibitors) + 1}"
+    logger.info(f"  Sheet '{sheet_name}': {len(exhibitors)} exhibitors")
+
+
+def save_excel(exhibitors, filename):
+    """Save to Excel with one worksheet per region"""
+    wb = Workbook()
+    # Remove default empty sheet
+    wb.remove(wb.active)
     
-    # Auto-filter
-    ws.auto_filter.ref = f"A1:{col_letter}{len(exhibitors) + 1}"
+    if not exhibitors:
+        logger.warning("No exhibitors to save!")
+        return
     
-    # ── Region Summary Sheet ──
-    ws2 = wb.create_sheet("Region Summary")
-    from collections import Counter
-    region_counts = Counter(ex.get("Region", "Unknown") for ex in exhibitors)
+    headers = list(exhibitors[0].keys())
     
-    ws2.append(["Region", "Count"])
-    for region, count in region_counts.most_common():
-        ws2.append([region, count])
-    ws2.append(["TOTAL", sum(region_counts.values())])
+    # ── Group by region ──
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for ex in exhibitors:
+        groups[ex.get("Region", "Unknown")].append(ex)
     
-    # Summary sheet styling
-    for cell in ws2["A1:B1"][0]:
+    # ── Sheet ordering: Chinese regions first, then overseas ──
+    chinese_order = [
+        "Shenzhen", "Xiamen", "Guangdong", "Fujian", "Zhejiang", 
+        "Jiangsu", "Shanghai", "Hong Kong", "Taiwan", "China Other"
+    ]
+    
+    logger.info("Writing region sheets:")
+    for region in chinese_order:
+        if region in groups:
+            write_sheet(wb, region, groups.pop(region), headers)
+    
+    # Remaining (Overseas, any unknown)
+    for region in sorted(groups.keys()):
+        write_sheet(wb, region, groups[region], headers)
+    
+    # ── Summary Sheet (first position) ──
+    ws_summary = wb.create_sheet(title="Summary", index=0)
+    
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+    
+    ws_summary.append(["Region", "Count"])
+    for cell in ws_summary["A1:B1"][0]:
         cell.font = header_font
         cell.fill = header_fill
-    ws2.column_dimensions["A"].width = 20
-    ws2.column_dimensions["B"].width = 12
+    
+    from collections import Counter
+    region_counts = Counter(ex.get("Region", "Unknown") for ex in exhibitors)
+    for region in chinese_order:
+        if region_counts[region] > 0:
+            ws_summary.append([region, region_counts[region]])
+    for region in sorted(groups.keys()):
+        ws_summary.append([region, region_counts[region]])
+    ws_summary.append(["TOTAL", sum(region_counts.values())])
+    
+    ws_summary.column_dimensions["A"].width = 20
+    ws_summary.column_dimensions["B"].width = 12
     
     filepath = OUTPUT_DIR / filename
     wb.save(filepath)
-    logger.info(f"Saved Excel: {filepath}")
+    logger.info(f"Saved Excel: {filepath} ({len(wb.sheetnames)} sheets)")
     return filepath
 
 
