@@ -1,6 +1,6 @@
 ---
 name: trade-show-exhibitor-scraper
-description: Scrape exhibitor data from trade show websites. Supports 4 architectures: GraphQL API (Reed Expo/NEPCON), Algolia Search API (NuernbergMesse Next.js sites like EUROGUSS), REST API with API Key (Messe Frankfurt), and CMS/AJAX (electronica). Outputs Excel with Chinese exhibitors classified by region.
+description: Scrape exhibitor data from trade show websites. Supports 6 architectures: GraphQL API (Reed Expo/NEPCON), Algolia Search API (NuernbergMesse Next.js like EUROGUSS), REST API with API Key (Messe Frankfurt), CMS/AJAX (electronica), Elementor Static HTML (FastenerExpo), and Django REST API + Referer Auth Bypass (Palexpo/INDEX). Outputs Excel with Chinese exhibitors classified by region.
 agent_created: true
 ---
 
