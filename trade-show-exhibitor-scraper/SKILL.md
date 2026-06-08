@@ -420,3 +420,16 @@ The scripts are provided as reference implementations, not for direct execution 
 
 ### 详情页补充字段
 - Algolia API 缺失 Website 和 Phone，需额外抓取详情页。Website 用 `re.search(r'Website.*?href="([^"]+)"', html)`，Phone 用 `re.search(r'href="tel:([^"]+)"', html)`
+
+## 经验更新 2026-06-08
+
+### FastenerExpo 2026 — Elementor 标题定位父容器提取法（新增 Workflow 5）
+- **适用**: 静态 HTML (Elementor/WordPress)，字段无 class/id，嵌套 `<div>` 无分隔标记
+- **核心方案**: `extract_field(soup, heading_text)` — 找到标题元素 → 逐级上溯父容器 → 取第一个文本长度超过标题的容器 → 去掉标题得值
+- **原因**: `find_next()` 遍历 DOM 会导致字段交叉污染（Booth 含 Country，Country 含 Type）；正则切分无分隔符不可靠。103/103 (100%) 成功
+
+### INDEX26 2026 — Django REST API + Referer 认证绕过（新增 Workflow 6）
+- **架构**: Nuxt.js/Vue 前端 → `catalog-admin.palexpo.ch` Django REST API 后端
+- **端点**: `GET /index/exhibitors_for_website/{event_id}` 获取展商；`GET /index/segments_categories_formatted_for_website/` 获取分类/国家映射
+- **认证绕过**: 设 `Referer` 和 `Origin` 头为前端域名（如 `https://www.indexnonwovens.com/`）即可绕过 JWT 登录
+- **关键坑**: Python httpx/requests 直接访问 `catalog-admin.palexpo.ch` 会卡住，需用 curl 或浏览器上下文 fetch
